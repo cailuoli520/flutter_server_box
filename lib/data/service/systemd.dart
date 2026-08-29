@@ -32,7 +32,20 @@ final class SystemdServiceManager implements ServiceManagerBackend {
     final raw = result.combined;
     final units = parseListUnits(result.stdout, scope);
     final failed = !result.succeeded;
-    return (units: units, failed: failed, raw: raw);
+    if (failed || units.isEmpty) return (units: units, failed: failed, raw: raw);
+
+    // Origins are a filtering nicety, not part of the listing: a host that
+    // cannot report them still has a usable page, so a failure here leaves
+    // every unit at its default rather than failing the scope.
+    final origins = await exec.run(originCommand(scope, units));
+    if (!origins.succeeded) return (units: units, failed: false, raw: raw);
+
+    final paths = parseFragmentPaths(origins.stdout);
+    final resolved = [
+      for (final unit in units)
+        unit.withOrigin(originOf(paths[unit.fullName], scope)),
+    ];
+    return (units: resolved, failed: false, raw: raw);
   }
 
   static String listCommand(ServiceScope scope) {
@@ -41,6 +54,86 @@ final class SystemdServiceManager implements ServiceManagerBackend {
         : 'systemctl --user';
     return '$prefix list-units --all --no-legend --no-pager --plain '
         '--type=service,socket,mount,timer';
+  }
+
+  /// Asks for the path of each unit already listed, rather than globbing.
+  ///
+  /// The names come from a listing the manager just produced, so they are
+  /// exactly the units the page will show — no pattern to over- or under-match,
+  /// and nothing fetched that is about to be discarded. `--` keeps a unit whose
+  /// name begins with a dash from being read as an option.
+  static String originCommand(ServiceScope scope, List<ServiceUnit> units) {
+    final prefix = scope == ServiceScope.system
+        ? 'systemctl'
+        : 'systemctl --user';
+    final names = units
+        .map((unit) => quotedServiceName(unit.fullName))
+        .join(' ');
+    return '$prefix show --no-pager --property=Id --property=FragmentPath '
+        '-- $names';
+  }
+
+  /// Parses `systemctl show --property=Id --property=FragmentPath` output.
+  ///
+  /// Units come back as blank-line separated blocks of `Key=Value`, but the
+  /// order of properties within a block is systemd's, not the order they were
+  /// asked for, so this keys off `Id=` rather than counting lines. A unit with
+  /// no fragment file still reports `FragmentPath=` with an empty value, which
+  /// is preserved: knowing a unit has no file is different from not knowing.
+  static Map<String, String> parseFragmentPaths(String output) {
+    final paths = <String, String>{};
+    var id = '';
+    var path = '';
+
+    for (final line in output.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.isEmpty) {
+        if (id.isNotEmpty) paths[id] = path;
+        id = '';
+        path = '';
+        continue;
+      }
+
+      final idx = trimmed.indexOf('=');
+      if (idx <= 0) continue;
+      final key = trimmed.substring(0, idx);
+      final value = trimmed.substring(idx + 1);
+
+      if (key == 'Id') {
+        // A blank line is what ends a block; a second `Id` only means one
+        // ended without its separator, which systemd does not do but which
+        // would otherwise merge two units. Resetting the path unconditionally
+        // here would instead discard a `FragmentPath` that arrived before its
+        // own `Id` — the very ordering this parser does not assume.
+        if (id.isNotEmpty) {
+          paths[id] = path;
+          path = '';
+        }
+        id = value;
+      } else if (key == 'FragmentPath') {
+        path = value;
+      }
+    }
+    if (id.isNotEmpty) paths[id] = path;
+    return paths;
+  }
+
+  /// Classifies a `FragmentPath`.
+  ///
+  /// The user manager reads from `~/.config/systemd/user`, whose absolute form
+  /// depends on the account, so that one is matched by suffix while the system
+  /// locations are matched by prefix.
+  static ServiceOrigin originOf(String? path, ServiceScope scope) {
+    if (path == null || path.isEmpty) return ServiceOrigin.transient;
+    if (path.startsWith('/etc/')) return ServiceOrigin.local;
+    if (scope == ServiceScope.user && path.contains('/.config/systemd/')) {
+      return ServiceOrigin.local;
+    }
+    if (path.startsWith('/run/')) return ServiceOrigin.runtime;
+    if (path.startsWith('/lib/') || path.startsWith('/usr/lib/')) {
+      return ServiceOrigin.vendor;
+    }
+    return ServiceOrigin.transient;
   }
 
   static List<ServiceUnit> parseListUnits(
@@ -95,7 +188,7 @@ final class SystemdServiceManager implements ServiceManagerBackend {
         : isRoot
         ? 'systemctl'
         : 'sudo systemctl';
-    final name = '${unit.name}.${unit.type.name}';
+    final name = unit.fullName;
     return '$prefix ${action.name} ${quotedServiceName(name)}';
   }
 }

@@ -26,10 +26,45 @@ final class _ServicesPageState extends ConsumerState<ServicesPage> {
   late final _pro = servicesProvider(widget.args.spi);
   late final _notifier = ref.read(_pro.notifier);
 
+  /// Kept here rather than in `ServicesState` because it is a view concern:
+  /// nothing outside this page acts on it, and the listing does not need to be
+  /// refetched when it changes.
+  var _originFilter = ServiceOriginFilter.local;
+
   @override
   void initState() {
     super.initState();
     Future.microtask(_refresh);
+  }
+
+  /// The units the scope filter allows, before the origin filter narrows them.
+  List<ServiceUnit> get _scopedUnits => _notifier.filteredUnits;
+
+  /// Whether narrowing by origin would change what is on screen.
+  ///
+  /// False on two hosts that look nothing alike: procd and OpenRC, whose
+  /// services all come from `/etc/init.d`, and a systemd host that could not
+  /// report paths at all, leaving every unit [ServiceOrigin.transient]. Neither
+  /// has anything to narrow — one because it is all local, the other because
+  /// nothing is known to be — and offering the choice on the first would be
+  /// inert while acting on it on the second would empty a page whose services
+  /// are all there.
+  bool _canFilterByOrigin(List<ServiceUnit> units) {
+    var hasLocal = false;
+    var hasOther = false;
+    for (final unit in units) {
+      if (unit.origin == ServiceOrigin.local) {
+        hasLocal = true;
+      } else {
+        hasOther = true;
+      }
+      if (hasLocal && hasOther) return true;
+    }
+    return false;
+  }
+
+  ServiceOriginFilter _effectiveOriginFilter(List<ServiceUnit> units) {
+    return _canFilterByOrigin(units) ? _originFilter : ServiceOriginFilter.all;
   }
 
   @override
@@ -80,6 +115,7 @@ final class _ServicesPageState extends ConsumerState<ServicesPage> {
             children: [
               if (manager != null) _buildManagerTag(manager),
               if (manager?.supportsUserScope == true) _buildScopeFilterChips(),
+              _buildOriginFilterChips(),
               if (notice.$1 case final value?)
                 _buildNotice(value, notice.$2),
               AnimatedContainer(
@@ -175,9 +211,25 @@ final class _ServicesPageState extends ConsumerState<ServicesPage> {
     ).paddingSymmetric(horizontal: 13, vertical: 8);
   }
 
+  Widget _buildOriginFilterChips() {
+    if (!_canFilterByOrigin(_scopedUnits)) return const SizedBox.shrink();
+    return Wrap(
+      spacing: 8,
+      children: ServiceOriginFilter.values.map((filter) {
+        return FilterChip(
+          selected: filter == _originFilter,
+          label: Text(filter.displayName),
+          onSelected: (_) => setState(() => _originFilter = filter),
+        );
+      }).toList(),
+    ).paddingSymmetric(horizontal: 13, vertical: 8);
+  }
+
   Widget _buildUnitList(ServiceManagerType? manager) {
     ref.watch(_pro.select((p) => (p.units, p.scopeFilter)));
-    final filteredUnits = _notifier.filteredUnits;
+    final scoped = _scopedUnits;
+    final filter = _effectiveOriginFilter(scoped);
+    final filteredUnits = scoped.where(filter.accepts).toList();
     if (filteredUnits.isEmpty) {
       return SliverToBoxAdapter(
         child: CenterGreyTitle(libL10n.empty).paddingSymmetric(horizontal: 13),

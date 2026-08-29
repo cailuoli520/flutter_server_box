@@ -81,6 +81,25 @@ backup.timer loaded active waiting Daily backup timer
 unsupported.target loaded active active A target
 ''';
 
+    // `systemctl show` answers in blocks, one per unit. `backup.timer` has an
+    // empty `FragmentPath`, which is what a unit with no file on disk reports.
+    const showOutput = '''
+Id=sshd.service
+FragmentPath=/lib/systemd/system/ssh.service
+
+Id=nginx.service
+FragmentPath=/etc/systemd/system/nginx.service
+
+Id=broken.service
+FragmentPath=/run/systemd/generator/broken.service
+
+Id=dbus.socket
+FragmentPath=/usr/lib/systemd/system/dbus.socket
+
+Id=backup.timer
+FragmentPath=
+''';
+
     test('parses unit type, state, scope, and description', () {
       final units = SystemdServiceManager.parseListUnits(
         output,
@@ -106,6 +125,7 @@ unsupported.target loaded active active A target
     test('keeps system units when the user scope is unavailable', () async {
       final exec = _QueueExec([
         _result(stdout: output),
+        _result(stdout: showOutput),
         _result(
           exitCode: 1,
           stderr: 'Failed to connect to bus: No medium found',
@@ -118,8 +138,112 @@ unsupported.target loaded active active A target
       expect(listing.notice, ServiceListingNotice.userScopeUnavailable);
       expect(exec.scripts, [
         SystemdServiceManager.listCommand(ServiceScope.system),
+        SystemdServiceManager.originCommand(
+          ServiceScope.system,
+          SystemdServiceManager.parseListUnits(output, ServiceScope.system),
+        ),
         SystemdServiceManager.listCommand(ServiceScope.user),
       ]);
+    });
+
+    test('asks for the path of each listed unit', () {
+      final units = SystemdServiceManager.parseListUnits(
+        output,
+        ServiceScope.system,
+      );
+
+      expect(
+        SystemdServiceManager.originCommand(ServiceScope.user, units),
+        'systemctl --user show --no-pager --property=Id '
+        "--property=FragmentPath -- 'sshd.service' 'nginx.service' "
+        "'broken.service' 'dbus.socket' 'backup.timer'",
+      );
+    });
+
+    test('classifies units by the path systemctl reports', () async {
+      final exec = _QueueExec([
+        _result(stdout: output),
+        _result(stdout: showOutput),
+        _result(),
+      ]);
+
+      final listing = await const SystemdServiceManager().list(exec);
+      final origins = {
+        for (final unit in listing.units) unit.name: unit.origin,
+      };
+
+      expect(origins, {
+        'sshd': ServiceOrigin.vendor,
+        'nginx': ServiceOrigin.local,
+        'broken': ServiceOrigin.runtime,
+        'dbus': ServiceOrigin.vendor,
+        'backup': ServiceOrigin.transient,
+      });
+    });
+
+    test('parses blocks regardless of property order', () {
+      final paths = SystemdServiceManager.parseFragmentPaths('''
+FragmentPath=/etc/systemd/system/nginx.service
+Id=nginx.service
+
+Id=backup.timer
+FragmentPath=
+''');
+
+      expect(paths, {
+        'nginx.service': '/etc/systemd/system/nginx.service',
+        'backup.timer': '',
+      });
+    });
+
+    test('ends a block on a second Id when the separator is missing', () {
+      final paths = SystemdServiceManager.parseFragmentPaths('''
+Id=a.service
+FragmentPath=/etc/systemd/system/a.service
+Id=b.service
+FragmentPath=/lib/systemd/system/b.service
+''');
+
+      expect(paths, {
+        'a.service': '/etc/systemd/system/a.service',
+        'b.service': '/lib/systemd/system/b.service',
+      });
+    });
+
+    test('leaves origins alone when paths cannot be read', () async {
+      final exec = _QueueExec([
+        _result(stdout: output),
+        _result(exitCode: 1, stderr: 'Unknown property Id'),
+        _result(),
+      ]);
+
+      final listing = await const SystemdServiceManager().list(exec);
+
+      expect(listing.notice, isNull);
+      expect(listing.units, hasLength(5));
+      expect(
+        listing.units.every((unit) => unit.origin == ServiceOrigin.transient),
+        isTrue,
+      );
+    });
+
+    test('reads the user manager own config dir as local', () {
+      expect(
+        SystemdServiceManager.originOf(
+          '/home/alice/.config/systemd/user/sync.service',
+          ServiceScope.user,
+        ),
+        ServiceOrigin.local,
+      );
+      // The same path under the system manager is not one of its search
+      // locations, so it must not be read as an operator's own unit.
+      expect(
+        SystemdServiceManager.originOf(
+          '/home/alice/.config/systemd/user/sync.service',
+          ServiceScope.system,
+        ),
+        ServiceOrigin.transient,
+      );
     });
 
     test('ignores stderr warnings from successful listings', () async {
@@ -189,6 +313,12 @@ uhttpd\t0
       expect(listing.notice, isNull);
       expect(listing.units.map((unit) => unit.name),
           ['dnsmasq', 'dropbear', 'rpcd', 'uhttpd']);
+      // Every init script is under `/etc`, so the origin filter must not be
+      // able to hide any of them.
+      expect(
+        listing.units.every((unit) => unit.origin == ServiceOrigin.local),
+        isTrue,
+      );
       final dnsmasq = listing.units.first;
       expect(dnsmasq.state, ServiceState.running);
       expect(dnsmasq.enabled, isTrue);
@@ -270,6 +400,10 @@ sshd
       expect(listing.notice, isNull);
       expect(listing.units.map((unit) => unit.name),
           ['acpid', 'chronyd', 'localmount', 'networking', 'sshd']);
+      expect(
+        listing.units.every((unit) => unit.origin == ServiceOrigin.local),
+        isTrue,
+      );
       expect(listing.units[0].state, ServiceState.running);
       expect(listing.units[0].enabled, isTrue);
       expect(listing.units[1].state, ServiceState.stopped);

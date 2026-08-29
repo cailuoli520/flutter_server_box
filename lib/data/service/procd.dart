@@ -57,6 +57,9 @@ done
           type: ServiceUnitType.service,
           scope: ServiceScope.system,
           state: states[name] ?? ServiceState.unknown,
+          // The catalog only ever walks `/etc/init.d`, so the origin filter
+          // has nothing to narrow here and must not empty the page.
+          origin: ServiceOrigin.local,
           enabled: enabledByName[name],
           actions: serviceActions(
             states[name] ?? ServiceState.unknown,
